@@ -204,10 +204,10 @@ void webCtrlServer(){
     server.on("/readSTS", handleSTS);
 
     server.on("/cmd", [](){
-    int cmdT = server.arg(0).toInt();
-    int cmdI = server.arg(1).toInt();
-    int cmdA = server.arg(2).toInt();
-    int cmdB = server.arg(3).toInt();
+    int cmdT = server.hasArg("inputT") ? server.arg("inputT").toInt() : server.arg("T").toInt();
+    int cmdI = server.hasArg("inputI") ? server.arg("inputI").toInt() : server.arg("I").toInt();
+    int cmdA = server.hasArg("inputA") ? server.arg("inputA").toInt() : server.arg("A").toInt();
+    int cmdB = server.hasArg("inputB") ? server.arg("inputB").toInt() : server.arg("B").toInt();
 
     switch(cmdT){
       case 0:activeID(cmdI);break;
@@ -294,7 +294,7 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 }
 
 
-void OnDataRecv(const esp_now_recv_info* recv_info, const uint8_t *incomingData, int len) {
+void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
   if(DEV_ROLE == 2){
     memcpy(&myData, incomingData, sizeof(myData));
     myData.Spd_send = abs(myData.Spd_send);

@@ -90,44 +90,128 @@ using namespace std;
 double deg2rad(double deg) { return deg * M_PI / 180.0; }
 double rad2deg(double rad) { return rad * 180.0 / M_PI; }
 
-// Normalize angle to [0, 2π)
-double normalizeAngle(double ang) {
-    ang = fmod(ang, 2 * M_PI);
-    if (ang < 0) ang += 2 * M_PI;
-    return ang;
+constexpr double H_BASE_MM = 50.0;
+constexpr double X_L_MM = 10.5;
+constexpr double X_R_MM = -10.5;
+constexpr double L1_MM = 50.0;
+constexpr double L2_MM = 170.0;
+constexpr double L3_MM = 170.0;
+constexpr double D_BA_MM = 50.0;
+constexpr double L_TIP_MM = 200.0;
+constexpr double THETA_LIMIT_RAD = M_PI / 2.0;
+constexpr double IK_EPS = 1e-6;
+
+static bool withinJointLimit(double angleRad) {
+    return fabs(angleRad) <= (THETA_LIMIT_RAD + 1e-6);
 }
 
-// Solve inverse kinematics for given x, y
-vector<pair<double, double>> solveInverseKinematics(double x, double y) {
-    const double l1 = 170.0;
-    const double l3 = 200.0;
+static double clampUnit(double x) {
+    if (x > 1.0) {
+        return 1.0;
+    }
+    if (x < -1.0) {
+        return -1.0;
+    }
+    return x;
+}
 
-    vector<pair<double, double>> solutions;
+static bool solveTrigEquation(double a, double b, double c, vector<double>& roots) {
+    roots.clear();
+    const double R = hypot(a, b);
+    if (R < IK_EPS) {
+        return false;
+    }
 
-    double R = sqrt(x * x + y * y);
-    double alpha = atan2(y, x);
-    double K = (x * x + y * y + l1 * l1 - l3 * l3) / (2 * l1);
+    const double ratio = c / R;
+    if (ratio < -1.0 - IK_EPS || ratio > 1.0 + IK_EPS) {
+        return false;
+    }
 
-    // Check reachability
-    if (fabs(K) > R) return solutions;
+    const double phi = atan2(b, a);
+    const double gamma = acos(clampUnit(ratio));
 
-    double delta = acos(K / R);
-    vector<double> theta1_candidates = { alpha + delta, alpha - delta };
+    roots.push_back(phi + gamma);
+    if (gamma > IK_EPS) {
+        roots.push_back(phi - gamma);
+    }
+    return true;
+}
 
-    for (double th1 : theta1_candidates) {
-        double c2 = (x - l1 * cos(th1)) / l3;
-        double s2 = (y - l1 * sin(th1)) / l3;
-        double th2 = atan2(s2, c2);
+static bool computeAnalyticalIK(double rTarget, double zTarget, double& thetaLeftDeg, double& thetaRightDeg) {
+    bool foundSolution = false;
+    double bestResidual = 0.0;
 
-        double th1n = normalizeAngle(th1);
-        double th2n = normalizeAngle(th2);
+    const double outputLen = D_BA_MM + L_TIP_MM;
+    vector<double> thetaRightCandidates;
+    const double rightA = -2.0 * L3_MM * (rTarget - X_R_MM);
+    const double rightB = -2.0 * L3_MM * zTarget;
+    const double rightC = outputLen * outputLen - (rTarget - X_R_MM) * (rTarget - X_R_MM)
+        - zTarget * zTarget - L3_MM * L3_MM;
 
-        if (th1n > th2n) {
-            solutions.emplace_back(rad2deg(th1n), rad2deg(th2n));
+    if (!solveTrigEquation(rightA, rightB, rightC, thetaRightCandidates)) {
+        return false;
+    }
+
+    for (double thetaRight : thetaRightCandidates) {
+        if (!withinJointLimit(thetaRight)) {
+            continue;
+        }
+
+        const double br = X_R_MM + L3_MM * sin(thetaRight);
+        const double bz = L3_MM * cos(thetaRight);
+
+        const double dr = rTarget - br;
+        const double dz = zTarget - bz;
+        const double dNorm = hypot(dr, dz);
+        if (dNorm < IK_EPS) {
+            continue;
+        }
+
+        const double ar = br + D_BA_MM * dr / dNorm;
+        const double az = bz + D_BA_MM * dz / dNorm;
+
+        vector<double> thetaLeftCandidates;
+        const double leftA = -2.0 * L1_MM * (ar - X_L_MM);
+        const double leftB = -2.0 * L1_MM * az;
+        const double leftC = L2_MM * L2_MM - (ar - X_L_MM) * (ar - X_L_MM)
+            - az * az - L1_MM * L1_MM;
+
+        if (!solveTrigEquation(leftA, leftB, leftC, thetaLeftCandidates)) {
+            continue;
+        }
+
+        for (double thetaLeft : thetaLeftCandidates) {
+            if (!withinJointLimit(thetaLeft)) {
+                continue;
+            }
+
+            const double p1r = X_L_MM + L1_MM * sin(thetaLeft);
+            const double p1z = L1_MM * cos(thetaLeft);
+
+            const double p1aR = ar - p1r;
+            const double p1aZ = az - p1z;
+            const double abR = br - ar;
+            const double abZ = bz - az;
+            const double elbowCross = p1aR * abZ - p1aZ * abR;
+
+            if (elbowCross <= 0.0) {
+                continue;
+            }
+
+            const double leftResidual = fabs((ar - p1r) * (ar - p1r) + (az - p1z) * (az - p1z) - L2_MM * L2_MM);
+            const double rightResidual = fabs((rTarget - br) * (rTarget - br) + (zTarget - bz) * (zTarget - bz) - outputLen * outputLen);
+
+            const double residual = leftResidual + rightResidual;
+            if (!foundSolution || residual < bestResidual) {
+                bestResidual = residual;
+                thetaLeftDeg = rad2deg(thetaLeft);
+                thetaRightDeg = rad2deg(thetaRight);
+                foundSolution = true;
+            }
         }
     }
 
-    return solutions;
+    return foundSolution;
 }
 
 
@@ -297,39 +381,40 @@ void dance() {
     int theta = -90;
     int r = 250;
     int z = 200;
-    vector<pair<double, double>> angles = solveInverseKinematics(r, z);
-    if (angles.empty()) {} 
-    else {
-      double theta_1 = angles[0].first;
-      double theta_2 = angles[0].second;
-      if(theta_1>30 and theta_1<150 and theta_2<20 and theta_2>-50){
-        int off_1 = 517;
-        int off_2 = 766;
-        int off_3 = 283;
-        int s1 = off_1 - theta*1024/180;
-        int s2 = off_2 - (theta_1-90)*1024/180;
-        int s3 = off_3 - (theta_2)*1024/180;
-        adaptiveSmoothMove(1,2,3, static_cast<int16_t>(s1),static_cast<int16_t>(s2),static_cast<int16_t>(s3));
-      }
+    double thetaLeft = 0.0;
+    double thetaRight = 0.0;
+    if (computeAnalyticalIK(r, z - H_BASE_MM, thetaLeft, thetaRight)) {
+      int off_1 = 517;
+      int off_2 = 766;
+      int off_3 = 283;
+      int s1 = off_1 - theta*1024/180;
+      int s2 = off_2 - (thetaLeft-90)*1024/180;
+      int s3 = off_3 - (thetaRight)*1024/180;
+      adaptiveSmoothMove(1,2,3, static_cast<int16_t>(s1),static_cast<int16_t>(s2),static_cast<int16_t>(s3));
     }
 }
 void ik(int cmdI, int cmdA,int cmdB){
     int theta = cmdA;
     int r = cmdI;
     int z = cmdB;
-    vector<pair<double, double>> angles = solveInverseKinematics(r, z);
-    if (angles.empty()) {} 
-    else {
-      double theta_1 = angles[0].first;
-      double theta_2 = angles[0].second;
-      if(theta_1>30 and theta_1<150 and theta_2<20 and theta_2>-50){
-        int off_1 = 462;
-        int off_2 = 771;
-        int off_3 = 710;
-        int s1 = off_1 - theta*1024/180;
-        int s2 = off_2 - (theta_1-90)*1024/180;
-        int s3 = off_3 + (theta_2)*1024/180;
-        adaptiveSmoothMove(1,2,3, static_cast<int16_t>(s1),static_cast<int16_t>(s2),static_cast<int16_t>(s3));
-      }
+    double thetaLeft = 0.0;
+    double thetaRight = 0.0;
+    if (!computeAnalyticalIK(r, z - H_BASE_MM, thetaLeft, thetaRight)) {
+      Serial.println("Analytical IK failed: target unreachable or violates elbow-up constraint.");
+      return;
     }
+
+    int off_1 = 462;
+    int off_2 = 771;
+    int off_3 = 710;
+    int s1 = off_1 - theta*1024/180;
+    int s2 = off_2 - (thetaLeft-90)*1024/180;
+    int s3 = off_3 + (thetaRight)*1024/180;
+
+    Serial.print("Analytical IK solution: theta_left=");
+    Serial.print(thetaLeft);
+    Serial.print(" deg theta_right=");
+    Serial.println(thetaRight);
+
+    adaptiveSmoothMove(1,2,3, static_cast<int16_t>(s1),static_cast<int16_t>(s2),static_cast<int16_t>(s3));
 }

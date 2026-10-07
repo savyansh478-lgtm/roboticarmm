@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# Large CAD files if needed
+*.step
+*.stp
+*.iges
+*.igs
+
+# Temporary files
+.vscode/
